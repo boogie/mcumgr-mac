@@ -154,7 +154,9 @@ async fn collect_ids(
 async fn device_properties(adapter: &Adapter, id: &PeripheralId) -> (Option<String>, Option<i16>) {
     match adapter.peripheral(id).await {
         Ok(p) => match p.properties().await {
-            Ok(Some(props)) => (props.local_name, props.rssi),
+            // BLE RSSI is always negative; CoreBluetooth reports 127 (or 0) when
+            // it is unavailable, so treat any non-negative value as unknown.
+            Ok(Some(props)) => (props.local_name, props.rssi.filter(|r| *r < 0)),
             _ => (None, None),
         },
         Err(_) => (None, None),
