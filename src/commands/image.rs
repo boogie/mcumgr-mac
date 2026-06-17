@@ -85,6 +85,11 @@ async fn upload(global: &GlobalOpts, file: &Path, slot: u8, chunk: usize) -> Res
     let max_attempts = 6u32;
 
     let mut offset: usize = 0;
+    // Guard against a device that keeps returning the same (or an earlier)
+    // offset, which would otherwise loop forever — typically because the target
+    // slot needs erasing first.
+    let mut stalls = 0u32;
+    let max_stalls = 8u32;
     while offset < total {
         let end = (offset + chunk).min(total);
         let piece = data[offset..end].to_vec();
@@ -127,10 +132,23 @@ async fn upload(global: &GlobalOpts, file: &Path, slot: u8, chunk: usize) -> Res
         messages::check_rc(&response)?;
 
         let parsed: UploadResponse = messages::decode(&response)?;
-        offset = parsed
+        let next = parsed
             .off
             .ok_or_else(|| anyhow!("device did not report the next offset"))?
             as usize;
+
+        if next > offset {
+            stalls = 0;
+        } else {
+            stalls += 1;
+            if stalls >= max_stalls {
+                bail!(
+                    "device is not advancing past offset {offset} (it keeps requesting {next}). \
+                     The target slot may need erasing first — try `image erase` then re-upload."
+                );
+            }
+        }
+        offset = next;
         progress.set_position(offset.min(total) as u64);
     }
 
