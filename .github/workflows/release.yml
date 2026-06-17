@@ -8,9 +8,19 @@ env:
   CARGO_TERM_COLOR: always
   BIN: mcumgr-mac
 
+# Code signing + notarization are enabled automatically when these repository
+# secrets are present (Settings → Secrets and variables → Actions):
+#   MACOS_CERT_P12_BASE64   base64 of your "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD     password for that .p12
+#   MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Your Name (TEAMID)"
+#   APPLE_API_KEY_ID        App Store Connect API key id
+#   APPLE_API_ISSUER_ID     App Store Connect API issuer id
+#   APPLE_API_KEY_BASE64    base64 of the App Store Connect API .p8 key
+# Without them, the workflow still publishes an unsigned universal binary.
+
 jobs:
   release:
-    name: Build universal macOS binary
+    name: Build, sign & notarize macOS binary
     runs-on: macos-latest
     permissions:
       contents: write
@@ -33,6 +43,66 @@ jobs:
             "target/x86_64-apple-darwin/release/${BIN}" \
             "target/aarch64-apple-darwin/release/${BIN}"
           chmod +x "dist/${BIN}"
+
+      - name: Detect signing secrets
+        id: signing
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          if [ -n "$SIGN_IDENTITY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Signing secrets not set — publishing an unsigned binary."
+          fi
+
+      - name: Import signing certificate
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+
+      - name: Sign (hardened runtime)
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          codesign --force --timestamp --options runtime \
+            --sign "$SIGN_IDENTITY" "dist/${BIN}"
+          codesign --verify --strict --verbose=2 "dist/${BIN}"
+
+      - name: Notarize
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          echo "$API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          # Notarization is keyed to the binary's code signature, so the same
+          # signed binary inside the tarball is recognized by Gatekeeper.
+          ditto -c -k --keepParent "dist/${BIN}" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$API_KEY_ID" \
+            --issuer "$API_ISSUER" \
+            --wait
+
+      - name: Package & checksum
+        run: |
           tar -C dist -czf "${BIN}-macos-universal.tar.gz" "${BIN}"
           shasum -a 256 "${BIN}-macos-universal.tar.gz" | tee "${BIN}-macos-universal.tar.gz.sha256"
 

@@ -53,10 +53,13 @@ Download the latest `mcumgr-mac-macos-universal.tar.gz` from the
 
 ```sh
 tar xzf mcumgr-mac-macos-universal.tar.gz
-# macOS quarantines downloaded binaries; clear the flag, then move into PATH:
-xattr -d com.apple.quarantine mcumgr-mac
 sudo mv mcumgr-mac /usr/local/bin/
 ```
+
+Release binaries are a universal build (Intel + Apple Silicon), signed with a
+Developer ID and notarized by Apple, so they run without Gatekeeper prompts. If
+you ever use an unsigned build, clear the quarantine flag first:
+`xattr -d com.apple.quarantine mcumgr-mac`.
 
 ### From source with Cargo
 
