@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: mcumgr-mac
+
+jobs:
+  release:
+    name: Build universal macOS binary
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Intel + Apple Silicon)
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output "dist/${BIN}" \
+            "target/x86_64-apple-darwin/release/${BIN}" \
+            "target/aarch64-apple-darwin/release/${BIN}"
+          chmod +x "dist/${BIN}"
+          tar -C dist -czf "${BIN}-macos-universal.tar.gz" "${BIN}"
+          shasum -a 256 "${BIN}-macos-universal.tar.gz" | tee "${BIN}-macos-universal.tar.gz.sha256"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.BIN }}-macos-universal.tar.gz
+            ${{ env.BIN }}-macos-universal.tar.gz.sha256
+          generate_release_notes: true
