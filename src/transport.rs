@@ -150,6 +150,16 @@ async fn collect_ids(
     order
 }
 
+/// Read a resolved peripheral's advertised name, if known (for status lines).
+pub async fn peripheral_name(peripheral: &Peripheral) -> Option<String> {
+    peripheral
+        .properties()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|p| p.local_name)
+}
+
 /// Read a discovered peripheral's advertised name and RSSI.
 async fn device_properties(adapter: &Adapter, id: &PeripheralId) -> (Option<String>, Option<i16>) {
     match adapter.peripheral(id).await {
@@ -437,6 +447,55 @@ impl SmpSession {
         tokio::time::timeout(timeout, self.read_response(seq))
             .await
             .map_err(|_| anyhow!("timed out waiting for SMP response (seq {seq})"))?
+    }
+
+    /// Like [`request_with_timeout`](Self::request_with_timeout) but also returns
+    /// promptly if the BLE link drops while waiting. macOS/btleplug doesn't end
+    /// the notification stream on disconnect, so without this a request whose
+    /// device vanished (e.g. an erase that knocks the radio offline) would block
+    /// for the whole timeout instead of failing in a few seconds.
+    pub async fn request_watching_link(
+        &mut self,
+        op: Op,
+        group: u16,
+        id: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let seq = self.next_seq();
+        let frame = smp::encode_frame(op, group, seq, id, payload);
+        self.peripheral
+            .write(&self.characteristic, &frame, WriteType::WithoutResponse)
+            .await
+            .context("writing SMP request")?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for SMP response (seq {seq})");
+            }
+            // Wait for the response in short slices; between them, check the link
+            // is still up so a disconnect is caught in ~1 s rather than `timeout`.
+            let slice = remaining.min(Duration::from_secs(1));
+            match tokio::time::timeout(slice, self.read_response(seq)).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    // On macOS, btleplug's is_connected() *hangs* (rather than
+                    // returning false) the moment the peripheral drops, so guard
+                    // it with its own timeout: anything but a prompt `true` means
+                    // the link is gone — bail and let the caller reconnect.
+                    let still_up = matches!(
+                        tokio::time::timeout(Duration::from_secs(2), self.peripheral.is_connected())
+                            .await,
+                        Ok(Ok(true))
+                    );
+                    if !still_up {
+                        bail!("BLE link dropped while waiting for SMP response (seq {seq})");
+                    }
+                }
+            }
+        }
     }
 
     /// Discard any buffered (possibly partial) notification bytes. Called after

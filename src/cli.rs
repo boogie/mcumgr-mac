@@ -27,7 +27,7 @@ pub struct GlobalOpts {
     pub id: Option<String>,
 
     /// Seconds to scan when resolving a device.
-    #[arg(long, default_value_t = 5, global = true)]
+    #[arg(long, default_value_t = 15, global = true)]
     pub scan_secs: u64,
 
     /// Per-operation response timeout, in seconds.
@@ -85,47 +85,50 @@ pub enum ImageCommand {
         file: PathBuf,
 
         /// Target slot number.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, help_heading = "Options (upload specific)")]
         slot: u8,
 
-        /// Data bytes per upload chunk [default: 128, or 480 with --fast].
-        /// Larger is faster if the device's MTU allows; auto-reduced if too big.
-        #[arg(long)]
+        /// Data bytes per upload chunk [default: 128, or 432 with --fast].
+        /// Bigger is faster on a DLE link (more bytes per ack) but only if the
+        /// MTU allows; auto-reduced if too big.
+        #[arg(long, help_heading = "Options (upload specific)")]
         chunk: Option<usize>,
 
         /// Erase the secondary slot before uploading. Needed for devices that
         /// do not erase during upload (Mynewt without IMG_MGMT_LAZY_ERASE).
-        #[arg(long)]
+        #[arg(long, help_heading = "Options (upload specific)")]
         erase: bool,
 
-        /// Chunks to keep in flight, pipelined [default: 1, or 8 with --fast].
+        /// Chunks to keep in flight, pipelined [default: 1, or 4 with --fast].
         /// Higher hides round-trip latency; auto-downgraded if the device
         /// cannot keep up.
-        #[arg(long)]
+        #[arg(long, help_heading = "Options (upload specific)")]
         window: Option<usize>,
 
         /// Use the fastest settings (large chunk + pipelining), automatically
         /// downgrading any tuning this device cannot handle.
-        #[arg(long)]
+        #[arg(long, help_heading = "Options (upload specific)")]
         fast: bool,
     },
 
     /// Mark an image for test on the next boot (defaults to the non-active image).
     Test {
         /// Image hash as hex. If omitted, the non-active image is used.
+        #[arg(help_heading = "Options (test and confirm specific)")]
         hash: Option<String>,
     },
 
     /// Confirm an image permanently (defaults to the unconfirmed image).
     Confirm {
         /// Image hash as hex. If omitted, the unconfirmed image is used.
+        #[arg(help_heading = "Options (test and confirm specific)")]
         hash: Option<String>,
     },
 
     /// Erase an image slot.
     Erase {
         /// Slot to erase (the secondary slot by default).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, help_heading = "Options (erase specific)")]
         slot: u8,
     },
 

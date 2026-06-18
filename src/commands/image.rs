@@ -1,7 +1,7 @@
 //! Image-group commands: list, upload, test, confirm, erase, and local info.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use comfy_table::{Attribute, Cell, Color};
@@ -49,10 +49,12 @@ async fn list(global: &GlobalOpts) -> Result<()> {
     Ok(())
 }
 
-/// Default chunk sizes and window depth.
+/// Default chunk size and the `--fast` presets.
 const DEFAULT_CHUNK: usize = 128;
-const FAST_CHUNK: usize = 480;
-const FAST_WINDOW: usize = 8;
+/// `--fast` uses a large chunk (more bytes per ack on a DLE link) plus a modest
+/// pipeline; the MTU auto-downgrade trims the chunk on smaller-MTU devices.
+const FAST_CHUNK: usize = 432;
+const FAST_WINDOW: usize = 4;
 const MIN_CHUNK: usize = 64;
 
 /// A recoverable upload failure that the orchestrator can downgrade around.
@@ -98,10 +100,10 @@ async fn upload(
         std::fs::read(file).with_context(|| format!("reading firmware file {}", file.display()))?;
 
     // Validate locally and show what we are about to flash.
-    match image_file::parse(&data) {
+    let new_version = match image_file::parse(&data) {
         Ok(info) => {
             ui::status(format!(
-                "Image {} \u{2022} {} bytes \u{2022} {}",
+                "Image v{} \u{2022} {} bytes \u{2022} {}",
                 style(&info.version).bold(),
                 info.image_size,
                 match info.hash_valid {
@@ -110,9 +112,13 @@ async fn upload(
                     None => style("no embedded hash").dim().to_string(),
                 }
             ));
+            Some(info.version)
         }
-        Err(e) => ui::warn(format!("{e}; uploading raw bytes anyway")),
-    }
+        Err(e) => {
+            ui::warn(format!("{e}; uploading raw bytes anyway"));
+            None
+        }
+    };
 
     if slot != 0 {
         ui::warn(format!(
@@ -125,13 +131,25 @@ async fn upload(
 
     let mut session = open_session(global).await?;
 
+    // Report the version transition, reading the currently running image.
+    if let Some(new_ver) = &new_version {
+        match read_state(&mut session).await {
+            Ok(state) => match state.images.iter().find(|s| s.active) {
+                Some(active) if !active.version.is_empty() => {
+                    ui::status(format!("Updating from v{} to v{new_ver}", active.version))
+                }
+                _ => ui::status(format!("Installing v{new_ver}")),
+            },
+            Err(_) => ui::status(format!("Installing v{new_ver}")),
+        }
+    }
+
     if erase {
-        erase_slot(&mut session).await?;
-        ui::success("Erased target slot");
+        session = robust_erase(global, session, 1).await?;
     }
 
     let progress = ui::upload_bar(total as u64);
-    upload_with_fallback(
+    let stats = upload_with_fallback(
         &mut session,
         &data,
         &sha,
@@ -144,21 +162,118 @@ async fn upload(
     .await?;
 
     progress.finish_and_clear();
-    ui::success(format!("Uploaded {total} bytes"));
+
+    let secs = stats.elapsed_secs();
+    let avg = if secs > 0.0 {
+        (total as f64 / 1024.0) / secs
+    } else {
+        0.0
+    };
+    let peak = stats.max_kbps;
+    let low = if stats.min_kbps.is_finite() {
+        stats.min_kbps
+    } else {
+        avg
+    };
+    let uploaded = match &new_version {
+        Some(v) => format!("v{v} ({total} bytes)"),
+        None => format!("{total} bytes"),
+    };
+    ui::success(format!(
+        "Uploaded {uploaded} in {secs:.1}s \u{2022} avg {avg:.2} KB/s"
+    ));
+    ui::status(format!(
+        "throughput: avg {avg:.2} \u{2022} peak {peak:.2} \u{2022} min {low:.2} KB/s"
+    ));
     ui::status("Run `image confirm` (and `reset`) to boot the new image.");
     session.disconnect().await;
     Ok(())
 }
 
-/// Erase the secondary image slot (the upload target).
-async fn erase_slot(session: &mut SmpSession) -> Result<()> {
-    let payload = messages::encode(&EraseRequest { slot: 1 })?;
+/// Send an erase and wait (with a generous timeout) for the ack, without the
+/// reconnect handling — used mid-upload by the auto-downgrade path.
+async fn erase_slot_simple(session: &mut SmpSession, slot: u8) -> Result<()> {
+    let payload = messages::encode(&EraseRequest { slot })?;
     let response = session
-        .request(Op::Write, group::IMAGE, image_cmd::ERASE, &payload)
-        .await
-        .context("erasing the slot")?;
+        .request_with_timeout(
+            Op::Write,
+            group::IMAGE,
+            image_cmd::ERASE,
+            &payload,
+            Duration::from_secs(60),
+        )
+        .await?;
     messages::check_rc(&response)?;
     Ok(())
+}
+
+/// Erase `slot`, tolerating the BLE link drop that a long flash erase can cause:
+/// erasing an occupied slot can block the device's radio past the supervision
+/// timeout, dropping the connection even though the erase completes. When that
+/// happens we reconnect (the device re-advertises once done) and confirm the
+/// slot is actually clear. Returns a live session.
+async fn robust_erase(
+    global: &GlobalOpts,
+    mut session: SmpSession,
+    slot: u8,
+) -> Result<SmpSession> {
+    let payload = messages::encode(&EraseRequest { slot })?;
+    match session
+        .request_watching_link(
+            Op::Write,
+            group::IMAGE,
+            image_cmd::ERASE,
+            &payload,
+            Duration::from_secs(60),
+        )
+        .await
+    {
+        Ok(response) => {
+            messages::check_rc(&response)?;
+            ui::success(format!("Erased slot {slot}"));
+            Ok(session)
+        }
+        // A transport error here is almost always the erase blocking the link
+        // (and, with reset-on-disconnect firmware, rebooting the device).
+        Err(_) => {
+            ui::warn(
+                "erase blocked the BLE link (the device is busy and will reboot); \
+                 reconnecting\u{2026}",
+            );
+            // Fully release the old peripheral and CoreBluetooth manager. An
+            // in-process re-scan only re-discovers the rebooted device with a
+            // *fresh* manager (CoreBluetooth won't re-report a device we still
+            // hold), and the old handle cannot reconnect — so we rebuild from
+            // scratch, exactly like a new invocation would.
+            drop(session);
+            let mut session = reconnect_fresh(global).await?;
+            let state = read_state(&mut session).await?;
+            if state.images.iter().any(|s| s.slot == slot as u32) {
+                bail!("slot {slot} still holds an image after the erase");
+            }
+            ui::success(format!("Erased slot {slot} (after reconnect)"));
+            Ok(session)
+        }
+    }
+}
+
+/// Rebuild a connection after the device dropped us and rebooted: retry a fresh
+/// scan + connect across a generous budget while it comes back up. Each attempt
+/// is time-bounded so a stuck connect can't hang the whole flow.
+async fn reconnect_fresh(global: &GlobalOpts) -> Result<SmpSession> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last_err = anyhow!("device did not come back after the erase");
+    loop {
+        match tokio::time::timeout(Duration::from_secs(45), open_session(global)).await {
+            Ok(Ok(session)) => return Ok(session),
+            Ok(Err(e)) => last_err = e,
+            Err(_) => last_err = anyhow!("reconnect attempt timed out"),
+        }
+        if Instant::now() >= deadline {
+            return Err(last_err).context("reconnecting after the erase dropped the link");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// Run the upload, downgrading individual tunings the device rejects until it
@@ -175,12 +290,12 @@ async fn upload_with_fallback(
     mut erased: bool,
     chunk_timeout: Duration,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<UploadStats> {
     loop {
         if window > 1 {
             match upload_windowed(session, data, sha, chunk, window, chunk_timeout, progress).await
             {
-                Ok(()) => return Ok(()),
+                Ok(stats) => return Ok(stats),
                 Err(e) => {
                     progress.println(format!(
                         "  pipelined upload didn't hold ({e}); falling back to sequential"
@@ -193,10 +308,12 @@ async fn upload_with_fallback(
         }
 
         match upload_sequential(session, data, sha, chunk, chunk_timeout, progress).await {
-            Ok(()) => return Ok(()),
+            Ok(stats) => return Ok(stats),
             Err(e) => match e.downcast_ref::<UploadIssue>() {
                 Some(UploadIssue::MtuTooLarge) if chunk > MIN_CHUNK => {
-                    let smaller = (chunk / 2).max(MIN_CHUNK);
+                    // Step down gently (×¾) so we land near the MTU limit rather
+                    // than overshooting by halving.
+                    let smaller = (chunk * 3 / 4).max(MIN_CHUNK);
                     progress.println(format!(
                         "  chunk {chunk} too large for this device; retrying at {smaller}"
                     ));
@@ -206,7 +323,7 @@ async fn upload_with_fallback(
                 }
                 Some(UploadIssue::SlotNeedsErase) if !erased => {
                     progress.println("  slot needs erasing; erasing and retrying");
-                    erase_slot(session).await?;
+                    erase_slot_simple(session, 1).await?;
                     erased = true;
                     session.reset_buffer();
                     continue;
@@ -229,6 +346,58 @@ fn upload_chunk(data: &[u8], sha: &[u8], offset: usize, chunk: usize) -> Result<
     Ok(payload)
 }
 
+/// Tracks upload timing and throughput, and (when the progress bar is hidden,
+/// e.g. redirected output) prints a milestone line every 5% showing the
+/// *instantaneous* rate over that interval. Also records min/peak instantaneous
+/// rate and total elapsed time for the closing summary.
+struct UploadStats {
+    start: std::time::Instant,
+    hidden: bool,
+    last_step: usize,
+    last_done: usize,
+    last_secs: f64,
+    min_kbps: f64,
+    max_kbps: f64,
+}
+
+impl UploadStats {
+    fn new(progress: &ProgressBar) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            hidden: progress.is_hidden(),
+            last_step: 0,
+            last_done: 0,
+            last_secs: 0.0,
+            min_kbps: f64::INFINITY,
+            max_kbps: 0.0,
+        }
+    }
+
+    /// Record progress; emit a milestone line on each new 5% step.
+    fn tick(&mut self, done: usize, total: usize) {
+        let step = (done * 20).checked_div(total).unwrap_or(20); // 5% steps
+        if step <= self.last_step {
+            return;
+        }
+        self.last_step = step;
+        let secs = self.start.elapsed().as_secs_f64();
+        let dbytes = done.saturating_sub(self.last_done) as f64;
+        let dsecs = (secs - self.last_secs).max(1e-6);
+        let inst = (dbytes / 1024.0) / dsecs; // instantaneous KB/s over this interval
+        self.min_kbps = self.min_kbps.min(inst);
+        self.max_kbps = self.max_kbps.max(inst);
+        if self.hidden {
+            eprintln!("  {:>3}%  {done}/{total} bytes  {secs:.0}s  {inst:.2} KB/s", step * 5);
+        }
+        self.last_done = done;
+        self.last_secs = secs;
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+}
+
 /// Strictly sequential upload: send a chunk, wait for its ack, repeat — with a
 /// per-chunk retry. This is the most compatible mode. Signals [`UploadIssue`]s
 /// the orchestrator can downgrade around.
@@ -239,11 +408,12 @@ async fn upload_sequential(
     chunk: usize,
     chunk_timeout: Duration,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<UploadStats> {
     let total = data.len();
     let mut offset: usize = 0;
     let mut stalls = 0u32;
     let max_stalls = 8u32;
+    let mut stats = UploadStats::new(progress);
 
     while offset < total {
         let payload = upload_chunk(data, sha, offset, chunk)?;
@@ -308,8 +478,9 @@ async fn upload_sequential(
         }
         offset = next;
         progress.set_position(offset.min(total) as u64);
+        stats.tick(offset.min(total), total);
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Pipelined upload: keep `window` chunks in flight to hide round-trip latency.
@@ -323,22 +494,29 @@ async fn upload_windowed(
     window: usize,
     chunk_timeout: Duration,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<UploadStats> {
     let total = data.len();
     let mut sent: usize = 0; // next offset to hand to the device
     let mut acked: usize = 0; // highest offset the device has confirmed
-    let mut inflight: usize = 0;
-    let mut stalls = 0u32;
-    let max_stalls = window as u32 * 4 + 8;
+    let mut stats = UploadStats::new(progress);
+
+    // If the window is too deep the device drops chunks and keeps re-reporting
+    // the first offset it is missing. Detect that and resync from there rather
+    // than flooding past the gap (which collapses throughput).
+    let mut no_progress = 0u32;
+    let resync_after = window as u32 + 4;
+    let mut total_stalls = 0u32;
+    let max_total_stalls = window as u32 * 16 + 32;
 
     while acked < total {
-        while inflight < window && sent < total {
+        // Keep at most `window` chunks of *unacknowledged* data in flight,
+        // measured from `acked` so a stall cannot run `sent` away from the gap.
+        while sent < total && sent - acked < window * chunk {
             let payload = upload_chunk(data, sha, sent, chunk)?;
             session
                 .send_request(Op::Write, group::IMAGE, image_cmd::UPLOAD, &payload)
                 .await?;
             sent = (sent + chunk).min(total);
-            inflight += 1;
         }
 
         let (_seq, payload) = session
@@ -346,8 +524,6 @@ async fn upload_windowed(
             .await
             .with_context(|| format!("waiting for upload ack ({acked}/{total} bytes)"))?;
         messages::check_rc(&payload)?;
-        inflight = inflight.saturating_sub(1);
-
         let parsed: UploadResponse = messages::decode(&payload)?;
         let off = parsed
             .off
@@ -355,26 +531,25 @@ async fn upload_windowed(
 
         if off > acked {
             acked = off;
-            stalls = 0;
+            no_progress = 0;
         } else {
-            stalls += 1;
-            if stalls >= max_stalls {
-                bail!(
-                    "windowed upload stuck at offset {acked} (device keeps requesting {off}). \
-                     Retry with --window 1, or add --erase."
-                );
+            no_progress += 1;
+            total_stalls += 1;
+            if total_stalls >= max_total_stalls {
+                bail!("windowed upload stuck at offset {acked}");
+            }
+            // Once the in-flight acks are drained and the device still wants
+            // `off`, rewind and resend from there.
+            if no_progress >= resync_after {
+                session.reset_buffer();
+                sent = off;
+                no_progress = 0;
             }
         }
-
-        // The device can only advance to the first offset it is missing, so if
-        // its expected offset is behind what we have sent and the window has
-        // drained, resend from there.
-        if off < sent && inflight == 0 {
-            sent = off;
-        }
         progress.set_position(acked.min(total) as u64);
+        stats.tick(acked.min(total), total);
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Mark an image for test (`confirm = false`) or confirm it (`confirm = true`).
@@ -417,13 +592,8 @@ async fn set_state(global: &GlobalOpts, hash: Option<String>, confirm: bool) -> 
 
 /// Erase an image slot.
 async fn erase(global: &GlobalOpts, slot: u8) -> Result<()> {
-    let mut session = open_session(global).await?;
-    let payload = messages::encode(&EraseRequest { slot })?;
-    let response = session
-        .request(Op::Write, group::IMAGE, image_cmd::ERASE, &payload)
-        .await?;
-    messages::check_rc(&response)?;
-    ui::success(format!("Slot {slot} erased"));
+    let session = open_session(global).await?;
+    let session = robust_erase(global, session, slot).await?;
     session.disconnect().await;
     Ok(())
 }
@@ -447,7 +617,7 @@ fn info(file: &Path) -> Result<()> {
     table.add_row(vec![field("File"), Cell::new(file.display())]);
     table.add_row(vec![
         field("Version"),
-        Cell::new(&info.version).add_attribute(Attribute::Bold),
+        Cell::new(format!("v{}", info.version)).add_attribute(Attribute::Bold),
     ]);
     table.add_row(vec![
         field("Image size"),
@@ -520,7 +690,7 @@ fn print_state(state: &ImageStateResponse) {
     for img in &state.images {
         table.add_row(vec![
             Cell::new(img.slot).add_attribute(Attribute::Bold),
-            Cell::new(&img.version),
+            Cell::new(format!("v{}", img.version)),
             flags_cell(img),
             Cell::new(hex::encode(&img.hash)).fg(Color::DarkGrey),
         ]);

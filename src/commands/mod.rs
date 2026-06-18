@@ -64,7 +64,11 @@ pub async fn open_session(global: &GlobalOpts) -> Result<SmpSession> {
     sp.finish_and_clear();
     let peripheral = resolved?;
 
-    let sp = ui::spinner("Connecting\u{2026}");
+    let adv_name = transport::peripheral_name(&peripheral).await;
+    let sp = ui::spinner(format!(
+        "Connecting to {}\u{2026}",
+        adv_name.as_deref().unwrap_or("device")
+    ));
     let connected = SmpSession::connect(peripheral, Duration::from_secs(global.timeout)).await;
     sp.finish_and_clear();
     let session = connected?;
