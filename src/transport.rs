@@ -486,8 +486,11 @@ impl SmpSession {
                     // it with its own timeout: anything but a prompt `true` means
                     // the link is gone — bail and let the caller reconnect.
                     let still_up = matches!(
-                        tokio::time::timeout(Duration::from_secs(2), self.peripheral.is_connected())
-                            .await,
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.peripheral.is_connected()
+                        )
+                        .await,
                         Ok(Ok(true))
                     );
                     if !still_up {

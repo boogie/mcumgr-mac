@@ -387,7 +387,10 @@ impl UploadStats {
         self.min_kbps = self.min_kbps.min(inst);
         self.max_kbps = self.max_kbps.max(inst);
         if self.hidden {
-            eprintln!("  {:>3}%  {done}/{total} bytes  {secs:.0}s  {inst:.2} KB/s", step * 5);
+            eprintln!(
+                "  {:>3}%  {done}/{total} bytes  {secs:.0}s  {inst:.2} KB/s",
+                step * 5
+            );
         }
         self.last_done = done;
         self.last_secs = secs;
@@ -429,7 +432,13 @@ async fn upload_sequential(
         let mut attempt = 0u32;
         let response = loop {
             match session
-                .request_with_timeout(Op::Write, group::IMAGE, image_cmd::UPLOAD, &payload, timeout)
+                .request_with_timeout(
+                    Op::Write,
+                    group::IMAGE,
+                    image_cmd::UPLOAD,
+                    &payload,
+                    timeout,
+                )
                 .await
             {
                 Ok(resp) => break resp,
@@ -467,7 +476,8 @@ async fn upload_sequential(
         let parsed: UploadResponse = messages::decode(&response)?;
         let next = parsed
             .off
-            .ok_or_else(|| anyhow!("device did not report the next offset"))? as usize;
+            .ok_or_else(|| anyhow!("device did not report the next offset"))?
+            as usize;
         if next > offset {
             stalls = 0;
         } else {
@@ -527,7 +537,8 @@ async fn upload_windowed(
         let parsed: UploadResponse = messages::decode(&payload)?;
         let off = parsed
             .off
-            .ok_or_else(|| anyhow!("device did not report the next offset"))? as usize;
+            .ok_or_else(|| anyhow!("device did not report the next offset"))?
+            as usize;
 
         if off > acked {
             acked = off;
