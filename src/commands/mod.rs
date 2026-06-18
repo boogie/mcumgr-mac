@@ -46,7 +46,7 @@ pub async fn open_session(global: &GlobalOpts) -> Result<SmpSession> {
     let opts = ResolveOptions {
         name: global.name.clone(),
         id: global.id.clone(),
-        all_devices: global.all_devices,
+        all_devices: !global.smp_devices,
         scan_secs: global.scan_secs,
         use_cache: !global.no_cache,
     };

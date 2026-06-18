@@ -316,8 +316,8 @@ fn select_after_scan(
     // otherwise it would connect to an arbitrary nearby BLE device.
     if opts.all_devices {
         bail!(
-            "no cached/known device seen during {}s scan. With --all-devices, pass \
-             --name or --id to pick one of the nearby devices (a random pick would be wrong).",
+            "no known device seen during {}s scan. Pass --name or --id to choose one of \
+             the nearby BLE devices, or --smp-devices to only consider SMP devices.",
             opts.scan_secs
         );
     }

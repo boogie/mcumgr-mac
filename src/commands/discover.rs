@@ -23,7 +23,8 @@ pub async fn run(global: &GlobalOpts) -> Result<()> {
             .unwrap_or_default()
     };
 
-    let kind = if global.all_devices {
+    let all_devices = !global.smp_devices;
+    let kind = if all_devices {
         "all BLE devices"
     } else {
         "SMP devices"
@@ -32,12 +33,8 @@ pub async fn run(global: &GlobalOpts) -> Result<()> {
         "Scanning for {kind} (up to {}s)\u{2026}",
         global.scan_secs
     ));
-    let mut devices = transport::discover(
-        &adapter,
-        Duration::from_secs(global.scan_secs),
-        global.all_devices,
-    )
-    .await?;
+    let mut devices =
+        transport::discover(&adapter, Duration::from_secs(global.scan_secs), all_devices).await?;
     sp.finish_and_clear();
 
     if devices.is_empty() {

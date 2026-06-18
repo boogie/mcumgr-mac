@@ -105,7 +105,8 @@ mcumgr-mac [OPTIONS] <COMMAND>
 | `--id <ID>` | Connect to a specific peripheral id |
 | `--scan-secs <N>` | How long to scan when resolving a device (default 5) |
 | `--timeout <N>` | Per-operation response timeout in seconds (default 30) |
-| `--all-devices` | Scan all BLE devices, not just those advertising the SMP service |
+| `--all-devices` | Scan all BLE devices (the default) |
+| `--smp-devices` | Only consider devices advertising the SMP service |
 | `--no-cache` | Do not read or update the device cache this run |
 | `-v, --verbose` | Verbose diagnostic logging |
 
@@ -143,10 +144,11 @@ For every command that needs a connection, the tool:
    arbitrary device.
 4. On a successful connection, the device is recorded/updated in the cache.
 
-By default the scan is filtered to the SMP service UUID. Many devices advertise
-SMP only after connecting (not in their advertisement), so if your device does
-not appear in `discover`, add `--all-devices` and select it by `--name` or
-`--id`.
+By default the scan includes all nearby BLE devices, because many devices
+advertise SMP only after connecting (not in their advertisement) and would be
+invisible to a filtered scan. Select a specific device with `--name` or `--id`.
+Use `--smp-devices` to restrict the scan to devices that advertise the SMP
+service.
 
 The cache lives at `~/Library/Application Support/mcumgr-mac/devices.json`.
 

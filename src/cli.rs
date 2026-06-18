@@ -34,9 +34,13 @@ pub struct GlobalOpts {
     #[arg(long, default_value_t = 30, global = true)]
     pub timeout: u64,
 
-    /// Scan all BLE devices, not only those advertising the SMP service.
+    /// Scan all BLE devices. This is the default; the flag is accepted for clarity.
     #[arg(long, global = true)]
     pub all_devices: bool,
+
+    /// Only consider devices advertising the SMP service.
+    #[arg(long, global = true, conflicts_with = "all_devices")]
+    pub smp_devices: bool,
 
     /// Do not read from or write to the device cache for this run.
     #[arg(long, global = true)]
