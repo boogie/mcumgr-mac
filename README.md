@@ -40,7 +40,13 @@ $ mcumgr-mac discover
 
 ## Installation
 
-### Prebuilt binary (recommended for macOS)
+### Homebrew (recommended for macOS)
+
+```sh
+brew install boogie/tap/mcumgr-mac
+```
+
+### Prebuilt binary
 
 Download the latest `mcumgr-mac-macos-universal.tar.gz` from the
 [Releases](https://github.com/boogie/mcumgr-mac/releases) page, then:
