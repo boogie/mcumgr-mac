@@ -445,6 +445,42 @@ impl SmpSession {
         self.assembler = smp::FrameAssembler::new();
     }
 
+    /// Write a request frame and return its sequence number without waiting for
+    /// a response. Used by the pipelined uploader to keep several requests in
+    /// flight.
+    pub async fn send_request(&mut self, op: Op, group: u16, id: u8, payload: &[u8]) -> Result<u8> {
+        let seq = self.next_seq();
+        let frame = smp::encode_frame(op, group, seq, id, payload);
+        self.peripheral
+            .write(&self.characteristic, &frame, WriteType::WithoutResponse)
+            .await
+            .context("writing SMP request")?;
+        Ok(seq)
+    }
+
+    /// Wait (up to `timeout`) for the next complete response frame, returning
+    /// its sequence number and CBOR payload.
+    pub async fn recv_response(&mut self, timeout: Duration) -> Result<(u8, Vec<u8>)> {
+        tokio::time::timeout(timeout, self.read_any_frame())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for SMP response"))?
+    }
+
+    /// Read notifications until a complete frame arrives, returning (seq, payload).
+    async fn read_any_frame(&mut self) -> Result<(u8, Vec<u8>)> {
+        loop {
+            if let Some(frame) = self.assembler.next_frame() {
+                let header = Header::decode(&frame)?;
+                return Ok((header.seq, frame[HEADER_LEN..].to_vec()));
+            }
+            match self.notifications.next().await {
+                Some(n) if n.uuid == self.characteristic.uuid => self.assembler.push(&n.value),
+                Some(_) => {}
+                None => bail!("notification stream ended before a response arrived"),
+            }
+        }
+    }
+
     /// Read notifications until a complete frame matching `want_seq` arrives.
     async fn read_response(&mut self, want_seq: u8) -> Result<Vec<u8>> {
         loop {

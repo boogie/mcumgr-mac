@@ -88,9 +88,26 @@ pub enum ImageCommand {
         #[arg(long, default_value_t = 0)]
         slot: u8,
 
-        /// Data bytes per upload chunk.
-        #[arg(long, default_value_t = 128)]
-        chunk: usize,
+        /// Data bytes per upload chunk [default: 128, or 480 with --fast].
+        /// Larger is faster if the device's MTU allows; auto-reduced if too big.
+        #[arg(long)]
+        chunk: Option<usize>,
+
+        /// Erase the secondary slot before uploading. Needed for devices that
+        /// do not erase during upload (Mynewt without IMG_MGMT_LAZY_ERASE).
+        #[arg(long)]
+        erase: bool,
+
+        /// Chunks to keep in flight, pipelined [default: 1, or 8 with --fast].
+        /// Higher hides round-trip latency; auto-downgraded if the device
+        /// cannot keep up.
+        #[arg(long)]
+        window: Option<usize>,
+
+        /// Use the fastest settings (large chunk + pipelining), automatically
+        /// downgrading any tuning this device cannot handle.
+        #[arg(long)]
+        fast: bool,
     },
 
     /// Mark an image for test on the next boot (defaults to the non-active image).
