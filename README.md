@@ -5,6 +5,9 @@ A fast, friendly command-line tool for managing **MCUmgr / SMP** devices over
 reset. Built in Rust on [btleplug](https://github.com/deviceplug/btleplug)
 (CoreBluetooth on macOS).
 
+> Prefer a browser? **[mcumgr-web](https://github.com/boogie/mcumgr-web)** is the
+> Web Bluetooth version of the same tool.
+
 ```
 $ mcumgr-mac discover
 ✓ Found 3 device(s)
